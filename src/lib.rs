@@ -14,7 +14,7 @@ use std::str;
 use bitflags::_core::str::from_utf8;
 
 use lopdf::content::{Content, Operation};
-use lopdf::{Document, Object, ObjectId, StringFormat};
+use lopdf::{Dictionary, Document, Error, Object, ObjectId, StringFormat};
 
 use crate::utils::*;
 
@@ -141,8 +141,6 @@ impl Form {
         let mut queue = VecDeque::new();
         // Block so borrow of doc ends before doc is moved into the result
         {
-            doc.decompress();
-
             let acroform = doc
                 .objects
                 .get_mut(
@@ -155,6 +153,10 @@ impl Form {
                 )
                 .ok_or(LoadError::NotAReference)?
                 .as_dict_mut()?;
+
+            // Sets the NeedAppearances option to true into "AcroForm" in order
+            // to render fields correctly
+            // acroform.set("NeedAppearances", Object::Boolean(true));
 
             let fields_list = acroform.get(b"Fields")?.as_array()?;
             queue.append(&mut VecDeque::from(fields_list.clone()));
@@ -433,10 +435,12 @@ impl Form {
                     .as_dict_mut()
                     .unwrap();
 
-                field.set("V", Object::string_literal(s.into_bytes()));
+                field.set("V", Object::String(s.into_bytes(), StringFormat::Literal));
 
-                // Regenerate text appearance confoming the new text but ignore the result
-                let _ = self.regenerate_text_appearance(n);
+                field.remove(b"I");
+
+                let ap = self.get_appearance();
+                // field.remove(b"AP");
 
                 Ok(())
             }
@@ -733,6 +737,22 @@ impl Form {
     /// Saves the form to the specified path
     pub fn save_to<W: Write>(&mut self, target: &mut W) -> Result<(), io::Error> {
         self.doc.save_to(target)
+    }
+
+    fn get_appearance(&self) -> Result<Dictionary, Error> {
+        if let Ok(appearance) = self
+            .doc
+            .trailer
+            .get(b"Root")?
+            .deref(&self.doc)
+            .map_err(|_| Error::ObjectNotFound)?
+            .as_dict()?
+            .get(b"AP")
+        {
+            appearance.as_dict().map(|dict| dict.to_owned())
+        } else {
+            Err(Error::ObjectNotFound)
+        }
     }
 
     fn get_possibilities(&self, oid: ObjectId) -> Vec<String> {
