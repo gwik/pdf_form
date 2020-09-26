@@ -141,6 +141,8 @@ impl Form {
         let mut queue = VecDeque::new();
         // Block so borrow of doc ends before doc is moved into the result
         {
+            doc.decompress();
+
             let acroform = doc
                 .objects
                 .get_mut(
@@ -435,12 +437,10 @@ impl Form {
                     .as_dict_mut()
                     .unwrap();
 
-                field.set("V", Object::String(s.into_bytes(), StringFormat::Literal));
+                field.set("V", Object::string_literal(s.into_bytes()));
 
-                field.remove(b"I");
-
-                let ap = self.get_appearance();
-                // field.remove(b"AP");
+                // Regenerate text appearance confoming the new text but ignore the result
+                let _ = self.regenerate_text_appearance(n);
 
                 Ok(())
             }
@@ -481,7 +481,7 @@ impl Form {
             .map(|object| {
                 object
                     .as_f64()
-                    .unwrap_or(object.as_i64().unwrap_or(0) as f64) as f32
+                    .unwrap_or(object.as_i64().unwrap_or(0) as f64)
             })
             .collect::<Vec<_>>();
 
@@ -515,48 +515,46 @@ impl Form {
             Operation::new("BT", vec![]),
         ]);
 
-        let font = parse_font(match da {
-            Object::String(ref bytes, _) => Some(from_utf8(bytes)?),
-            _ => None,
-        });
+        // The default font object (/Helv 12 Tf 0 g)
+        let default_font = ("Helv", 12, 0, "g");
+
+        // Build the font basing on the default appearance, if exists, if not,
+        // assume a default font (surely to be improved!)
+        let font = match da {
+            Object::String(ref bytes, _) => {
+                let values = from_utf8(bytes)?
+                    .trim_start_matches('/')
+                    .split(' ')
+                    .collect::<Vec<_>>();
+
+                if values.len() != 5 {
+                    default_font
+                } else {
+                    (
+                        values[0],
+                        values[1].parse::<i32>().unwrap_or(0),
+                        values[3].parse::<i32>().unwrap_or(0),
+                        values[4],
+                    )
+                }
+            }
+            _ => default_font,
+        };
 
         // Define some helping font variables
-        let font_name = (font.0).0;
-        let font_size = (font.0).1;
-        let font_color = font.1;
+        let font_name = font.0;
+        let font_size = font.1;
+        let font_color = (font.2, font.3);
 
         // Set the font type and size and color
         content.operations.append(&mut vec![
             Operation::new("Tf", vec![font_name.into(), font_size.into()]),
-            Operation::new(
-                font_color.0,
-                match font_color.0 {
-                    "k" => vec![
-                        font_color.1.into(),
-                        font_color.2.into(),
-                        font_color.3.into(),
-                        font_color.4.into(),
-                    ],
-                    "rg" => vec![
-                        font_color.1.into(),
-                        font_color.2.into(),
-                        font_color.3.into(),
-                    ],
-                    _ => vec![font_color.1.into()],
-                },
-            ),
+            Operation::new(font_color.1, vec![font_color.0.into()]),
         ]);
 
         // Calcolate the text offset
-        let x = 2.0; // Suppose this fixed offset as we should have known the border here
-
-        // Formula picked up from Poppler
-        let dy = rect[1] - rect[3];
-        let y = if dy > 0.0 {
-            0.5 * dy - 0.4 * font_size as f32
-        } else {
-            0.5 * font_size as f32
-        };
+        let x = 3.0; // Suppose this fixed offset as we should have known the border here
+        let y = 0.5 * (rect[3] - rect[1]) - 0.4 * font_size as f64; // Formula picked up from Poppler
 
         // Set the text bounds, first are fixed at "1 0 0 1" and then the calculated x,y
         content.operations.append(&mut vec![Operation::new(
@@ -737,22 +735,6 @@ impl Form {
     /// Saves the form to the specified path
     pub fn save_to<W: Write>(&mut self, target: &mut W) -> Result<(), io::Error> {
         self.doc.save_to(target)
-    }
-
-    fn get_appearance(&self) -> Result<Dictionary, Error> {
-        if let Ok(appearance) = self
-            .doc
-            .trailer
-            .get(b"Root")?
-            .deref(&self.doc)
-            .map_err(|_| Error::ObjectNotFound)?
-            .as_dict()?
-            .get(b"AP")
-        {
-            appearance.as_dict().map(|dict| dict.to_owned())
-        } else {
-            Err(Error::ObjectNotFound)
-        }
     }
 
     fn get_possibilities(&self, oid: ObjectId) -> Vec<String> {
