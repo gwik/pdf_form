@@ -12,7 +12,7 @@ use std::str;
 use bitflags::_core::str::from_utf8;
 
 use lopdf::content::{Content, Operation};
-use lopdf::{Document, Object, ObjectId, StringFormat};
+use lopdf::{Dictionary, Document, Object, ObjectId, StringFormat};
 
 use crate::utils::*;
 
@@ -209,10 +209,12 @@ impl Form {
             .as_dict()
             .unwrap();
 
-        let type_str = field.get(b"FT").unwrap().as_name_str().unwrap();
+        let type_str = field.get(b"FT").unwrap().as_name_str().unwrap_or_default();
         if type_str == "Btn" {
             let flags = ButtonFlags::from_bits_truncate(get_field_flags(field));
-            if flags.intersects(ButtonFlags::RADIO | ButtonFlags::NO_TOGGLE_TO_OFF) {
+            if has_kids(field)
+                || flags.intersects(ButtonFlags::RADIO | ButtonFlags::NO_TOGGLE_TO_OFF)
+            {
                 FieldType::Radio
             } else if flags.intersects(ButtonFlags::PUSHBUTTON) {
                 FieldType::Button
@@ -642,7 +644,33 @@ impl Form {
                         .unwrap()
                         .as_dict_mut()
                         .unwrap();
-                    field.set("V", Object::Name(choice.into_bytes()));
+
+                    field.set("V", Object::Name(choice.clone().into_bytes()));
+
+                    let kids = iter_kids(field).collect::<Vec<_>>();
+
+                    for kid in kids {
+                        let Some(kid) = self
+                            .document
+                            .objects
+                            .get_mut(&kid)
+                            .unwrap()
+                            .as_dict_mut()
+                            .ok()
+                        else {
+                            continue;
+                        };
+
+                        let val = get_on_value(kid);
+                        if val == choice {
+                            kid.set("AS", Object::Name(choice.clone().into_bytes()));
+                            kid.set("V", Object::Name(choice.clone().into_bytes()));
+                        } else {
+                            kid.set("AS", Object::Name("Off".to_owned().into_bytes()));
+                            kid.set("V", Object::Name(choice.clone().into_bytes()));
+                        }
+                    }
+
                     Ok(())
                 } else {
                     Err(ValueError::InvalidSelection)
@@ -770,6 +798,7 @@ impl Form {
             .as_dict()
             .unwrap()
             .get(b"Kids");
+
         if let Ok(&Object::Array(ref kids)) = kids_obj {
             for (i, kid) in kids.iter().enumerate() {
                 let mut found = false;
@@ -801,4 +830,16 @@ impl Form {
 
         res
     }
+}
+
+fn iter_kids(dict: &Dictionary) -> impl Iterator<Item = ObjectId> + '_ {
+    dict.get(b"Kids")
+        .and_then(|kids| kids.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|kid| kid.as_reference().ok())
+}
+
+fn has_kids(dict: &Dictionary) -> bool {
+    iter_kids(dict).next().is_some()
 }
