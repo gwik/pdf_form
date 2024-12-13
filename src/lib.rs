@@ -1,7 +1,5 @@
 #[macro_use]
 extern crate bitflags;
-#[macro_use]
-extern crate derive_error;
 
 mod utils;
 
@@ -40,30 +38,37 @@ pub enum FieldType {
     Unknown,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, thiserror::Error)]
 /// Errors that may occur while loading a PDF
 pub enum LoadError {
     /// An Lopdf Error
-    LopdfError(lopdf::Error),
+    #[error(transparent)]
+    LopdfError(#[from] lopdf::Error),
     /// The reference `ObjectId` did not point to any values
-    #[error(non_std, no_from)]
+    #[error("no such reference: {0:?}")]
     NoSuchReference(ObjectId),
     /// An element that was expected to be a reference was not a reference
+    #[error("not a reference")]
     NotAReference,
 }
 
 /// Errors That may occur while setting values in a form
-#[derive(Debug, Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum ValueError {
     /// The method used to set the state is incompatible with the type of the field
+    #[error("Type mismatch")]
     TypeMismatch,
     /// One or more selected values are not valid choices
+    #[error("Invalid selection")]
     InvalidSelection,
     /// Multiple values were selected when only one was allowed
+    #[error("Too many selected")]
     TooManySelected,
     /// Readonly field cannot be edited
+    #[error("Readonly")]
     Readonly,
     /// Field not found
+    #[error("Not found")]
     NotFound,
 }
 
@@ -486,8 +491,8 @@ impl Form {
             .iter()
             .map(|object| {
                 object
-                    .as_f64()
-                    .unwrap_or(object.as_i64().unwrap_or(0) as f64) as f32
+                    .as_f32()
+                    .unwrap_or(object.as_i64().unwrap_or(0) as f32)
             })
             .collect::<Vec<_>>();
 

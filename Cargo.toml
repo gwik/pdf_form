@@ -8,7 +8,7 @@ authors = [
 ]
 description = "A library for programatically filling out pdf forms"
 repository = "https://github.com/Emulator000/pdf_form"
-edition = "2018"
+edition = "2021"
 readme = "README.md"
 keywords = ["pdf_form", "pdf", "form", "forms", "field"]
 license = "MIT"
@@ -16,5 +16,5 @@ exclude = [".idea"]
 
 [dependencies]
 bitflags = "^1.2"
-derive-error = "^0.0.4"
-lopdf = "^0.25"
+lopdf = "0.34.0"
+thiserror = "2"
