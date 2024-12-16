@@ -38,6 +38,45 @@ pub enum FieldType {
     Unknown,
 }
 
+mod sealed {
+    pub trait Index {}
+}
+
+pub trait Index: sealed::Index + Copy {
+    fn object_id(&self, form: &Form) -> Option<ObjectId>;
+
+    fn field_dict<'f>(&self, form: &'f Form) -> Result<&'f Dictionary, lopdf::Error> {
+        let Some(oid) = self.object_id(form) else {
+            return Err(lopdf::Error::ObjectNotFound);
+        };
+
+        form.document.get_object(oid)?.as_dict()
+    }
+
+    fn field_dict_mut<'f>(&self, form: &'f mut Form) -> Result<&'f mut Dictionary, lopdf::Error> {
+        let Some(oid) = self.object_id(form) else {
+            return Err(lopdf::Error::ObjectNotFound);
+        };
+        form.document.get_object_mut(oid)?.as_dict_mut()
+    }
+}
+
+impl sealed::Index for usize {}
+
+impl Index for usize {
+    fn object_id(&self, form: &Form) -> Option<ObjectId> {
+        form.form_ids.get(*self).cloned()
+    }
+}
+
+impl sealed::Index for ObjectId {}
+
+impl Index for ObjectId {
+    fn object_id(&self, _form: &Form) -> Option<ObjectId> {
+        Some(*self)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 /// Errors that may occur while loading a PDF
 pub enum LoadError {
@@ -195,19 +234,18 @@ impl Form {
         self.len() == 0
     }
 
+    /// Returns an iterator over the fields object ids.
+    pub fn field_object_ids(&self) -> impl Iterator<Item = ObjectId> + '_ {
+        self.form_ids.iter().copied()
+    }
+
     /// Gets the type of field of the given index
     ///
     /// # Panics
     /// This function will panic if the index is greater than the number of fields
-    pub fn get_type(&self, n: usize) -> FieldType {
+    pub fn get_type(&self, n: impl Index) -> FieldType {
         // unwraps should be fine because load should have verified everything exists
-        let field = self
-            .document
-            .objects
-            .get(&self.form_ids[n])
-            .unwrap()
-            .as_dict()
-            .unwrap();
+        let field = n.field_dict(self).unwrap();
 
         let type_str = field.get(b"FT").unwrap().as_name_str().unwrap_or_default();
         if type_str == "Btn" {
@@ -239,15 +277,9 @@ impl Form {
     ///
     /// # Panics
     /// This function will panic if the index is greater than the number of fields
-    pub fn get_name(&self, n: usize) -> Option<String> {
+    pub fn get_name(&self, n: impl Index) -> Option<String> {
         // unwraps should be fine because load should have verified everything exists
-        let field = self
-            .document
-            .objects
-            .get(&self.form_ids[n])
-            .unwrap()
-            .as_dict()
-            .unwrap();
+        let field = n.field_dict(self).unwrap();
 
         // The "T" key refers to the name of the field
         match field.get(b"T") {
@@ -278,14 +310,8 @@ impl Form {
     ///
     /// # Panics
     /// This function will panic if the index is greater than the number of fields
-    pub fn get_state(&self, n: usize) -> FieldState {
-        let field = self
-            .document
-            .objects
-            .get(&self.form_ids[n])
-            .unwrap()
-            .as_dict()
-            .unwrap();
+    pub fn get_state(&self, n: impl Index) -> FieldState {
+        let field = n.field_dict(self).unwrap();
         match self.get_type(n) {
             FieldType::Button => FieldState::Button,
             FieldType::Radio => FieldState::Radio {
@@ -296,7 +322,7 @@ impl Form {
                         _ => "".to_owned(),
                     },
                 },
-                options: self.get_possibilities(self.form_ids[n]),
+                options: self.get_possibilities(n.object_id(self).unwrap()),
                 readonly: is_read_only(field),
                 required: is_required(field),
             },
@@ -430,8 +456,8 @@ impl Form {
     ///
     /// # Panics
     /// Will panic if n is larger than the number of fields
-    pub fn get_object_id(&self, n: usize) -> ObjectId {
-        self.form_ids[n]
+    pub fn get_object_id(&self, n: impl Index) -> ObjectId {
+        n.object_id(self).unwrap()
     }
 
     /// If the field at index `n` is a text field, fills in that field with the text `s`.
@@ -439,16 +465,12 @@ impl Form {
     ///
     /// # Panics
     /// Will panic if n is larger than the number of fields
-    pub fn set_text(&mut self, n: usize, s: String) -> Result<(), ValueError> {
+    pub fn set_text(&mut self, n: impl Index, s: String) -> Result<(), ValueError> {
         match self.get_state(n) {
             FieldState::Text { .. } => {
-                let field = self
-                    .document
-                    .objects
-                    .get_mut(&self.form_ids[n])
-                    .unwrap()
-                    .as_dict_mut()
-                    .unwrap();
+                let Ok(field) = n.field_dict_mut(self) else {
+                    return Err(ValueError::NotFound);
+                };
 
                 field.set("V", Object::string_literal(s.into_bytes()));
 
@@ -470,15 +492,8 @@ impl Form {
     /// the global document DA.
     ///
     /// A more sophisticated parser is needed here
-    fn regenerate_text_appearance(&mut self, n: usize) -> Result<(), lopdf::Error> {
-        let field = {
-            self.document
-                .objects
-                .get(&self.form_ids[n])
-                .unwrap()
-                .as_dict()
-                .unwrap()
-        };
+    fn regenerate_text_appearance(&mut self, n: impl Index) -> Result<(), lopdf::Error> {
+        let field = n.field_dict(self)?;
 
         // The value of the object (should be a string)
         let value = field.get(b"V")?.to_owned();
@@ -600,16 +615,12 @@ impl Form {
     ///
     /// # Panics
     /// Will panic if n is larger than the number of fields
-    pub fn set_check_box(&mut self, n: usize, is_checked: bool) -> Result<(), ValueError> {
+    pub fn set_check_box(&mut self, n: impl Index, is_checked: bool) -> Result<(), ValueError> {
         match self.get_state(n) {
             FieldState::CheckBox { .. } => {
-                let field = self
-                    .document
-                    .objects
-                    .get_mut(&self.form_ids[n])
-                    .unwrap()
-                    .as_dict_mut()
-                    .unwrap();
+                let Ok(field) = n.field_dict_mut(self) else {
+                    return Err(ValueError::NotFound)?;
+                };
 
                 let on = get_on_value(field);
                 let state = Object::Name(
@@ -633,17 +644,13 @@ impl Form {
     ///
     /// # Panics
     /// Will panic if n is larger than the number of fields
-    pub fn set_radio(&mut self, n: usize, choice: String) -> Result<(), ValueError> {
+    pub fn set_radio(&mut self, n: impl Index, choice: String) -> Result<(), ValueError> {
         match self.get_state(n) {
             FieldState::Radio { options, .. } => {
                 if options.contains(&choice) {
-                    let field = self
-                        .document
-                        .objects
-                        .get_mut(&self.form_ids[n])
-                        .unwrap()
-                        .as_dict_mut()
-                        .unwrap();
+                    let Ok(field) = n.field_dict_mut(self) else {
+                        return Err(ValueError::NotFound);
+                    };
 
                     field.set("V", Object::Name(choice.clone().into_bytes()));
 
@@ -685,7 +692,7 @@ impl Form {
     ///
     /// # Panics
     /// Will panic if n is larger than the number of fields
-    pub fn set_list_box(&mut self, n: usize, choices: Vec<String>) -> Result<(), ValueError> {
+    pub fn set_list_box(&mut self, n: impl Index, choices: Vec<String>) -> Result<(), ValueError> {
         match self.get_state(n) {
             FieldState::ListBox {
                 options,
@@ -696,13 +703,9 @@ impl Form {
                     if !multiselect && choices.len() > 1 {
                         Err(ValueError::TooManySelected)
                     } else {
-                        let field = self
-                            .document
-                            .objects
-                            .get_mut(&self.form_ids[n])
-                            .unwrap()
-                            .as_dict_mut()
-                            .unwrap();
+                        let Ok(field) = n.field_dict_mut(self) else {
+                            return Err(ValueError::NotFound);
+                        };
                         match choices.len() {
                             0 => field.set("V", Object::Null),
                             1 => field.set(
@@ -742,19 +745,15 @@ impl Form {
     ///
     /// # Panics
     /// Will panic if n is larger than the number of fields
-    pub fn set_combo_box(&mut self, n: usize, choice: String) -> Result<(), ValueError> {
+    pub fn set_combo_box(&mut self, n: impl Index, choice: String) -> Result<(), ValueError> {
         match self.get_state(n) {
             FieldState::ComboBox {
                 options, editable, ..
             } => {
                 if options.contains(&choice) || editable {
-                    let field = self
-                        .document
-                        .objects
-                        .get_mut(&self.form_ids[n])
-                        .unwrap()
-                        .as_dict_mut()
-                        .unwrap();
+                    let Ok(field) = n.field_dict_mut(self) else {
+                        return Err(ValueError::NotFound);
+                    };
                     field.set(
                         "V",
                         Object::String(choice.into_bytes(), StringFormat::Literal),
@@ -772,9 +771,9 @@ impl Form {
     ///
     /// # Panics
     /// Will panic if n is larger than the number of fields
-    pub fn remove_field(&mut self, n: usize) -> Result<(), ValueError> {
+    pub fn remove_field(&mut self, n: impl Index) -> Result<(), ValueError> {
         self.document
-            .remove_object(&self.get_object_id(n))
+            .remove_object(&n.object_id(self).ok_or_else(|| ValueError::NotFound)?)
             .map_err(|_| ValueError::NotFound)
     }
 
