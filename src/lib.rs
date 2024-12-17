@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate bitflags;
 
+pub mod encoding;
 mod utils;
 
 use std::collections::VecDeque;
@@ -458,6 +459,28 @@ impl Form {
     /// Will panic if n is larger than the number of fields
     pub fn get_object_id(&self, n: impl Index) -> ObjectId {
         n.object_id(self).unwrap()
+    }
+
+    pub fn set_encoded_text(
+        &mut self,
+        n: impl Index,
+        s: impl Into<Vec<u8>>,
+    ) -> Result<(), ValueError> {
+        match self.get_state(n) {
+            FieldState::Text { .. } => {
+                let Ok(field) = n.field_dict_mut(self) else {
+                    return Err(ValueError::NotFound);
+                };
+
+                field.set("V", Object::string_literal(s));
+
+                // Regenerate text appearance confoming the new text but ignore the result
+                let _ = self.regenerate_text_appearance(n);
+
+                Ok(())
+            }
+            _ => Err(ValueError::TypeMismatch),
+        }
     }
 
     /// If the field at index `n` is a text field, fills in that field with the text `s`.
