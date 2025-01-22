@@ -13,9 +13,24 @@ use std::str;
 use bitflags::_core::str::from_utf8;
 
 use lopdf::content::{Content, Operation};
-use lopdf::{Dictionary, Document, Object, ObjectId, StringFormat};
+use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, StringFormat};
 
 use crate::utils::*;
+
+#[derive(Debug, Clone)]
+pub struct FieldRenderingConfig {
+    pub font: Option<ObjectId>,
+    pub split_lines_char: u8,
+}
+
+impl Default for FieldRenderingConfig {
+    fn default() -> Self {
+        FieldRenderingConfig {
+            font: None,
+            split_lines_char: 0xa,
+        }
+    }
+}
 
 /// A PDF Form that contains fillable fields
 ///
@@ -24,6 +39,7 @@ use crate::utils::*;
 /// index.
 pub struct Form {
     pub document: Document,
+    rendering_config: FieldRenderingConfig,
     form_ids: Vec<ObjectId>,
 }
 
@@ -184,6 +200,10 @@ impl Form {
         Self::load_doc(doc)
     }
 
+    pub fn set_rendering_config(&mut self, config: FieldRenderingConfig) {
+        self.rendering_config = config
+    }
+
     fn load_doc(mut document: Document) -> Result<Self, LoadError> {
         let mut form_ids = Vec::new();
         let mut queue = VecDeque::new();
@@ -222,7 +242,11 @@ impl Form {
                 }
             }
         }
-        Ok(Form { document, form_ids })
+        Ok(Form {
+            document,
+            form_ids,
+            rendering_config: Default::default(),
+        })
     }
 
     /// Returns the number of fields the form has
@@ -461,6 +485,25 @@ impl Form {
         n.object_id(self).unwrap()
     }
 
+    pub fn set_all_fields_read_only(&mut self) -> Result<(), ValueError> {
+        for i in 0..self.len() {
+            self.set_readonly(i)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_readonly(&mut self, n: impl Index) -> Result<(), ValueError> {
+        let field = n.field_dict_mut(self).map_err(|_| ValueError::NotFound)?;
+        let flags = FieldFlags::from_bits_truncate(get_field_flags(field));
+        field.set(
+            "Ff",
+            Object::Integer((flags.bits() | FieldFlags::READONLY.bits()) as i64),
+        );
+        let _ = self.regenerate_text_appearance(n);
+
+        Ok(())
+    }
+
     pub fn set_encoded_text(
         &mut self,
         n: impl Index,
@@ -495,7 +538,9 @@ impl Form {
                     return Err(ValueError::NotFound);
                 };
 
-                field.set("V", Object::string_literal(s.into_bytes()));
+                field.set("V", Object::string_literal(s.as_bytes()));
+
+                self.clear_sub_widget_rendering(n)?;
 
                 // Regenerate text appearance confoming the new text but ignore the result
                 let _ = self.regenerate_text_appearance(n);
@@ -504,6 +549,100 @@ impl Form {
             }
             _ => Err(ValueError::TypeMismatch),
         }
+    }
+
+    /// Like `set_encoded_text` but force multiline text field.
+    pub fn set_encoded_multiline_text(
+        &mut self,
+        n: impl Index,
+        s: impl Into<Vec<u8>>,
+    ) -> Result<(), ValueError> {
+        match self.get_state(n) {
+            FieldState::Text { .. } => {
+                let Ok(field) = n.field_dict_mut(self) else {
+                    return Err(ValueError::NotFound);
+                };
+
+                field.set("V", Object::string_literal(s));
+                let mut flags = field
+                    .get(b"Ff")
+                    .ok()
+                    .and_then(|flags| flags.as_i64().ok())
+                    .unwrap_or(0);
+
+                flags |= 1 << 12;
+                field.set("Ff", flags);
+
+                // Regenerate text appearance confoming the new text but ignore the result
+                let _ = self.regenerate_text_appearance(n);
+
+                Ok(())
+            }
+            _ => Err(ValueError::TypeMismatch),
+        }
+    }
+
+    // Clear the rendering of the sub widget
+    fn clear_sub_widget_rendering(&mut self, n: impl Index) -> Result<(), ValueError> {
+        // Clear the rendering of the widget
+
+        match self.get_state(n) {
+            FieldState::Text { .. } => {
+                let Ok(field) = n.field_dict(self) else {
+                    return Err(ValueError::NotFound);
+                };
+
+                let kids = field
+                    .get(b"Kids")
+                    .ok()
+                    .and_then(|kid| kid.as_array().ok())
+                    .iter()
+                    .map(|kids| kids.iter())
+                    .flatten()
+                    .filter_map(|kid| kid.as_reference().ok())
+                    .collect::<Vec<_>>();
+
+                for kid in kids {
+                    let Some(dict) = self
+                        .document
+                        .get_dictionary_mut(kid)
+                        .ok()
+                        .filter(|dict| matches!(dict.get(b"Subtype").ok(), Some(Object::Name(n)) if n == b"Widget"))
+                    else {
+                        continue;
+                    };
+
+                    dict.remove(b"AP");
+                }
+
+                Ok(())
+            }
+            _ => Err(ValueError::TypeMismatch),
+        }
+    }
+
+    /// Remove PDF object from document's object list.
+    pub fn remove_object(&mut self, object_id: &ObjectId) -> Result<(), lopdf::Error> {
+        for (_, page_id) in self.document.get_pages() {
+            let page = self.document.get_object_mut(page_id)?.as_dict_mut()?;
+            let Some(annots) = page
+                .get_mut(b"Annots")
+                .ok()
+                .and_then(|annots| annots.as_array_mut().ok())
+            else {
+                continue;
+            };
+
+            annots.retain(|object| {
+                if let Ok(id) = object.as_reference() {
+                    return id != *object_id;
+                }
+
+                true
+            });
+        }
+
+        Ok(())
     }
 
     /// Regenerates the appearance for the field at index `n` due to an alteration of the
@@ -518,8 +657,16 @@ impl Form {
     fn regenerate_text_appearance(&mut self, n: impl Index) -> Result<(), lopdf::Error> {
         let field = n.field_dict(self)?;
 
+        let is_multiline = field
+            .get(b"Ff")
+            .and_then(|flags| flags.as_i64())
+            .map(|flags| flags >> 12 & 1 == 1)
+            .unwrap_or(false);
+
         // The value of the object (should be a string)
-        let value = field.get(b"V")?.to_owned();
+        let Object::String(value, _) = field.get(b"V")?.to_owned() else {
+            return Err(lopdf::Error::StringDecode);
+        };
 
         // The default appearance of the object (should be a string)
         let da = field.get(b"DA")?.to_owned();
@@ -540,6 +687,32 @@ impl Form {
         let object_id = field.get(b"AP")?.as_dict()?.get(b"N")?.as_reference()?;
         let stream = self.document.get_object_mut(object_id)?.as_stream_mut()?;
 
+        let font = parse_font(match da {
+            Object::String(ref bytes, _) => Some(from_utf8(bytes)?),
+            _ => None,
+        });
+
+        // Define some helping font variables
+        let font_name = font.0 .0;
+        let font_size = (font.0).1;
+        let font_color = font.1;
+
+        if let Some(font_oid) = self.rendering_config.font {
+            let resources = if let Some(resources) = stream.dict.get_mut(b"Resources").ok() {
+                resources
+            } else {
+                stream
+                    .dict
+                    .set("Resources", Object::Dictionary(Default::default()));
+                stream.dict.get_mut(b"Resources").unwrap()
+            };
+
+            resources.as_dict_mut().unwrap().set(
+                "Font",
+                dictionary!(dbg!(font_name) => Object::Reference(font_oid)),
+            );
+        }
+
         // Decode and get the content, even if is compressed
         let mut content = {
             if let Ok(content) = stream.decompressed_content() {
@@ -549,15 +722,17 @@ impl Form {
             }
         };
 
-        // Ignored operators
-        let ignored_operators = vec![
-            "bt", "tc", "tw", "tz", "g", "tm", "tr", "tf", "tj", "et", "q", "bmc", "emc",
-        ];
+        // // Ignored operators
+        // let ignored_operators = vec![
+        //     "bt", "tc", "tw", "tz", "tm", "tr", "tf", "tj", "et", "bmc", "emc",
+        // ];
 
-        // Remove these ignored operators as we have to generate the text and fonts again
-        content.operations.retain(|operation| {
-            !ignored_operators.contains(&operation.operator.to_lowercase().as_str())
-        });
+        // // Remove these ignored operators as we have to generate the text and fonts again
+        // content.operations.retain(|operation| {
+        //     !ignored_operators.contains(&operation.operator.to_lowercase().as_str())
+        // });
+
+        content.operations.clear();
 
         // Let's construct the text widget
         content.operations.append(&mut vec![
@@ -565,16 +740,6 @@ impl Form {
             Operation::new("q", vec![]),
             Operation::new("BT", vec![]),
         ]);
-
-        let font = parse_font(match da {
-            Object::String(ref bytes, _) => Some(from_utf8(bytes)?),
-            _ => None,
-        });
-
-        // Define some helping font variables
-        let font_name = (font.0).0;
-        let font_size = (font.0).1;
-        let font_color = font.1;
 
         // Set the font type and size and color
         content.operations.append(&mut vec![
@@ -598,26 +763,45 @@ impl Form {
             ),
         ]);
 
-        // Calculate the text offset
-        let x = 2.0; // Suppose this fixed offset as we should have known the border here
+        let lines = if is_multiline {
+            value
+                .split(|&c| c == self.rendering_config.split_lines_char)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        } else {
+            vec![value]
+        };
+
+        dbg!(lines.len());
 
         // Formula picked up from Poppler
         let dy = rect[1] - rect[3];
         let y = if dy > 0.0 {
             0.5 * dy - 0.4 * font_size as f32
         } else {
-            0.5 * font_size as f32
+            -dy - 1.1 * font_size as f32
         };
 
-        // Set the text bounds, first are fixed at "1 0 0 1" and then the calculated x,y
-        content.operations.append(&mut vec![Operation::new(
-            "Tm",
-            vec![1.into(), 0.into(), 0.into(), 1.into(), x.into(), y.into()],
-        )]);
+        let line_height = 1.5 * font_size as f32;
+
+        // dbg!(x, y, rect, dy, font_size);
+        // dbg!(&lines);
+
+        content.operations.append(&mut vec![
+            Operation::new("Tr", vec![Object::from(0u32)]),
+            Operation::new("Td", vec![Object::from(1u32), Object::from(y)]),
+        ]);
+
+        for line in lines {
+            dbg!(line.len());
+            content.operations.append(&mut vec![
+                Operation::new("Tj", vec![Object::string_literal(line)]),
+                Operation::new("Td", vec![Object::from(0u32), Object::from(-line_height)]),
+            ]);
+        }
 
         // Set the text value and some finalizing operations
         content.operations.append(&mut vec![
-            Operation::new("Tj", vec![value]),
             Operation::new("ET", vec![]),
             Operation::new("Q", vec![]),
             Operation::new("EMC", vec![]),
