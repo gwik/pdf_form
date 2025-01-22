@@ -17,21 +17,6 @@ use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, StringFormat};
 
 use crate::utils::*;
 
-#[derive(Debug, Clone)]
-pub struct FieldRenderingConfig {
-    pub font: Option<ObjectId>,
-    pub split_lines_char: u8,
-}
-
-impl Default for FieldRenderingConfig {
-    fn default() -> Self {
-        FieldRenderingConfig {
-            font: None,
-            split_lines_char: 0xa,
-        }
-    }
-}
-
 /// A PDF Form that contains fillable fields
 ///
 /// Use this struct to load an existing PDF with a fillable form using the `load` method.  It will
@@ -39,7 +24,6 @@ impl Default for FieldRenderingConfig {
 /// index.
 pub struct Form {
     pub document: Document,
-    rendering_config: FieldRenderingConfig,
     form_ids: Vec<ObjectId>,
 }
 
@@ -200,10 +184,6 @@ impl Form {
         Self::load_doc(doc)
     }
 
-    pub fn set_rendering_config(&mut self, config: FieldRenderingConfig) {
-        self.rendering_config = config
-    }
-
     fn load_doc(mut document: Document) -> Result<Self, LoadError> {
         let mut form_ids = Vec::new();
         let mut queue = VecDeque::new();
@@ -242,11 +222,7 @@ impl Form {
                 }
             }
         }
-        Ok(Form {
-            document,
-            form_ids,
-            rendering_config: Default::default(),
-        })
+        Ok(Form { document, form_ids })
     }
 
     /// Returns the number of fields the form has
@@ -538,40 +514,11 @@ impl Form {
                     return Err(ValueError::NotFound);
                 };
 
-                field.set("V", Object::string_literal(s.as_bytes()));
+                let (encoded, _, _) = encoding_rs::UTF_16LE.encode(&s);
+
+                field.set("V", Object::string_literal(encoded.to_owned()));
 
                 self.clear_sub_widget_rendering(n)?;
-
-                // Regenerate text appearance confoming the new text but ignore the result
-                let _ = self.regenerate_text_appearance(n);
-
-                Ok(())
-            }
-            _ => Err(ValueError::TypeMismatch),
-        }
-    }
-
-    /// Like `set_encoded_text` but force multiline text field.
-    pub fn set_encoded_multiline_text(
-        &mut self,
-        n: impl Index,
-        s: impl Into<Vec<u8>>,
-    ) -> Result<(), ValueError> {
-        match self.get_state(n) {
-            FieldState::Text { .. } => {
-                let Ok(field) = n.field_dict_mut(self) else {
-                    return Err(ValueError::NotFound);
-                };
-
-                field.set("V", Object::string_literal(s));
-                let mut flags = field
-                    .get(b"Ff")
-                    .ok()
-                    .and_then(|flags| flags.as_i64().ok())
-                    .unwrap_or(0);
-
-                flags |= 1 << 12;
-                field.set("Ff", flags);
 
                 // Regenerate text appearance confoming the new text but ignore the result
                 let _ = self.regenerate_text_appearance(n);
@@ -655,13 +602,16 @@ impl Form {
     ///
     /// A more sophisticated parser is needed here
     fn regenerate_text_appearance(&mut self, n: impl Index) -> Result<(), lopdf::Error> {
+        // return Ok(());
+
         let field = n.field_dict(self)?;
 
-        let is_multiline = field
-            .get(b"Ff")
-            .and_then(|flags| flags.as_i64())
-            .map(|flags| flags >> 12 & 1 == 1)
-            .unwrap_or(false);
+        let is_multiline = true;
+        // let is_multiline = field
+        //     .get(b"Ff")
+        //     .and_then(|flags| flags.as_i64())
+        //     .map(|flags| flags >> 12 & 1 == 1)
+        //     .unwrap_or(false);
 
         // The value of the object (should be a string)
         let Object::String(value, _) = field.get(b"V")?.to_owned() else {
@@ -687,31 +637,19 @@ impl Form {
         let object_id = field.get(b"AP")?.as_dict()?.get(b"N")?.as_reference()?;
         let stream = self.document.get_object_mut(object_id)?.as_stream_mut()?;
 
-        let font = parse_font(match da {
-            Object::String(ref bytes, _) => Some(from_utf8(bytes)?),
-            _ => None,
-        });
+        let resources = if let Some(resources) = stream.dict.get_mut(b"Resources").ok() {
+            resources
+        } else {
+            stream
+                .dict
+                .set("Resources", Object::Dictionary(Default::default()));
+            stream.dict.get_mut(b"Resources").unwrap()
+        };
 
-        // Define some helping font variables
-        let font_name = font.0 .0;
-        let font_size = (font.0).1;
-        let font_color = font.1;
-
-        if let Some(font_oid) = self.rendering_config.font {
-            let resources = if let Some(resources) = stream.dict.get_mut(b"Resources").ok() {
-                resources
-            } else {
-                stream
-                    .dict
-                    .set("Resources", Object::Dictionary(Default::default()));
-                stream.dict.get_mut(b"Resources").unwrap()
-            };
-
-            resources.as_dict_mut().unwrap().set(
-                "Font",
-                dictionary!(dbg!(font_name) => Object::Reference(font_oid)),
-            );
-        }
+        resources
+            .as_dict_mut()
+            .unwrap()
+            .set("Font", dictionary!("Arial" => Object::Reference((1437, 0))));
 
         // Decode and get the content, even if is compressed
         let mut content = {
@@ -741,6 +679,16 @@ impl Form {
             Operation::new("BT", vec![]),
         ]);
 
+        let font = parse_font(match da {
+            Object::String(ref bytes, _) => Some(from_utf8(bytes)?),
+            _ => None,
+        });
+
+        // Define some helping font variables
+        let font_name = (font.0).0;
+        let font_size = (font.0).1;
+        let font_color = font.1;
+
         // Set the font type and size and color
         content.operations.append(&mut vec![
             Operation::new("Tf", vec![font_name.into(), font_size.into()]),
@@ -763,16 +711,18 @@ impl Form {
             ),
         ]);
 
-        let lines = if is_multiline {
+        let lines = if dbg!(is_multiline) {
+            dbg!(&value);
             value
-                .split(|&c| c == self.rendering_config.split_lines_char)
+                .split(|&c| c == 0xa)
                 .map(ToOwned::to_owned)
                 .collect::<Vec<_>>()
         } else {
             vec![value]
         };
 
-        dbg!(lines.len());
+        // Calculate the text offset
+        let x = 2.0; // Suppose this fixed offset as we should have known the border here
 
         // Formula picked up from Poppler
         let dy = rect[1] - rect[3];
@@ -784,8 +734,8 @@ impl Form {
 
         let line_height = 1.5 * font_size as f32;
 
-        // dbg!(x, y, rect, dy, font_size);
-        // dbg!(&lines);
+        dbg!(x, y, rect, dy, font_size);
+        dbg!(&lines);
 
         content.operations.append(&mut vec![
             Operation::new("Tr", vec![Object::from(0u32)]),
@@ -793,7 +743,6 @@ impl Form {
         ]);
 
         for line in lines {
-            dbg!(line.len());
             content.operations.append(&mut vec![
                 Operation::new("Tj", vec![Object::string_literal(line)]),
                 Operation::new("Td", vec![Object::from(0u32), Object::from(-line_height)]),
@@ -810,7 +759,7 @@ impl Form {
         // Set the new content to the original stream and compress it
         if let Ok(encoded_content) = content.encode() {
             stream.set_plain_content(encoded_content);
-            let _ = stream.compress();
+            // let _ = stream.compress();
         }
 
         Ok(())
