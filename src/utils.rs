@@ -71,6 +71,7 @@ pub fn get_on_value(field: &Dictionary) -> String {
     option.unwrap_or("Yes".into())
 }
 
+#[allow(unused)]
 pub fn parse_font(font_string: Option<&str>) -> ((&str, i32), (&str, i32, i32, i32, i32)) {
     // The default font object (/Helv 12 Tf 0 g)
     let default_font = ("Helv", 12);

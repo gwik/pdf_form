@@ -12,8 +12,7 @@ use std::str;
 
 use bitflags::_core::str::from_utf8;
 
-use lopdf::content::{Content, Operation};
-use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, StringFormat};
+use lopdf::{decode_text_string, Dictionary, Document, Object, ObjectId, StringFormat};
 
 use crate::utils::*;
 
@@ -441,8 +440,8 @@ impl Form {
             },
             FieldType::Text => FieldState::Text {
                 text: match field.get(b"V") {
-                    Ok(&Object::String(ref s, StringFormat::Literal)) => {
-                        str::from_utf8(&s.clone()).unwrap().to_owned()
+                    Ok(object @ &Object::String(_, _)) => {
+                        decode_text_string(object).unwrap_or_default()
                     }
                     _ => "".to_owned(),
                 },
@@ -470,14 +469,32 @@ impl Form {
 
     pub fn set_readonly(&mut self, n: impl Index) -> Result<(), ValueError> {
         let field = n.field_dict_mut(self).map_err(|_| ValueError::NotFound)?;
-        let flags = FieldFlags::from_bits_truncate(get_field_flags(field));
-        field.set(
-            "Ff",
-            Object::Integer((flags.bits() | FieldFlags::READONLY.bits()) as i64),
-        );
-        let _ = self.regenerate_text_appearance(n);
+        let flags = field
+            .get(b"Ff")
+            .and_then(|flags| flags.as_i64())
+            .unwrap_or(0) as u32;
+        field.set("Ff", Object::Integer((flags | 1u32) as i64));
 
         Ok(())
+    }
+
+    pub fn set_multiline(&mut self, n: impl Index) -> Result<(), ValueError> {
+        match self.get_state(n) {
+            FieldState::Text { .. } => {
+                let Ok(field) = n.field_dict_mut(self) else {
+                    return Err(ValueError::NotFound);
+                };
+
+                let flags = field
+                    .get(b"Ff")
+                    .and_then(|flags| flags.as_i64())
+                    .unwrap_or(0) as u32;
+                field.set("Ff", Object::Integer((flags | (1u32 << 12)) as i64));
+
+                Ok(())
+            }
+            _ => Err(ValueError::TypeMismatch),
+        }
     }
 
     pub fn set_encoded_text(
@@ -494,7 +511,7 @@ impl Form {
                 field.set("V", Object::string_literal(s));
 
                 // Regenerate text appearance confoming the new text but ignore the result
-                let _ = self.regenerate_text_appearance(n);
+                let _ = self.reset_text_appearance(n);
 
                 Ok(())
             }
@@ -514,14 +531,12 @@ impl Form {
                     return Err(ValueError::NotFound);
                 };
 
-                let (encoded, _, _) = encoding_rs::UTF_16LE.encode(&s);
-
-                field.set("V", Object::string_literal(encoded.to_owned()));
+                field.set("V", Object::string_literal(s));
 
                 self.clear_sub_widget_rendering(n)?;
 
                 // Regenerate text appearance confoming the new text but ignore the result
-                let _ = self.regenerate_text_appearance(n);
+                let _ = self.reset_text_appearance(n);
 
                 Ok(())
             }
@@ -592,176 +607,10 @@ impl Form {
         Ok(())
     }
 
-    /// Regenerates the appearance for the field at index `n` due to an alteration of the
-    /// original TextField value, the AP will be updated accordingly.
-    ///
-    /// # Incomplete
-    /// This function is not exhaustive as not parse the original TextField orientation
-    /// or the text alignment and other kind of enrichments, also doesn't discover for
-    /// the global document DA.
-    ///
-    /// A more sophisticated parser is needed here
-    fn regenerate_text_appearance(&mut self, n: impl Index) -> Result<(), lopdf::Error> {
-        // return Ok(());
-
-        let field = n.field_dict(self)?;
-
-        let is_multiline = true;
-        // let is_multiline = field
-        //     .get(b"Ff")
-        //     .and_then(|flags| flags.as_i64())
-        //     .map(|flags| flags >> 12 & 1 == 1)
-        //     .unwrap_or(false);
-
-        // The value of the object (should be a string)
-        let Object::String(value, _) = field.get(b"V")?.to_owned() else {
-            return Err(lopdf::Error::StringDecode);
-        };
-
-        // The default appearance of the object (should be a string)
-        let da = field.get(b"DA")?.to_owned();
-
-        // The default appearance of the object (should be a string)
-        let rect = field
-            .get(b"Rect")?
-            .as_array()?
-            .iter()
-            .map(|object| {
-                object
-                    .as_f32()
-                    .unwrap_or(object.as_i64().unwrap_or(0) as f32)
-            })
-            .collect::<Vec<_>>();
-
-        // Gets the object stream
-        let object_id = field.get(b"AP")?.as_dict()?.get(b"N")?.as_reference()?;
-        let stream = self.document.get_object_mut(object_id)?.as_stream_mut()?;
-
-        let resources = if let Some(resources) = stream.dict.get_mut(b"Resources").ok() {
-            resources
-        } else {
-            stream
-                .dict
-                .set("Resources", Object::Dictionary(Default::default()));
-            stream.dict.get_mut(b"Resources").unwrap()
-        };
-
-        resources
-            .as_dict_mut()
-            .unwrap()
-            .set("Font", dictionary!("Arial" => Object::Reference((1437, 0))));
-
-        // Decode and get the content, even if is compressed
-        let mut content = {
-            if let Ok(content) = stream.decompressed_content() {
-                Content::decode(&content)?
-            } else {
-                Content::decode(&stream.content)?
-            }
-        };
-
-        // // Ignored operators
-        // let ignored_operators = vec![
-        //     "bt", "tc", "tw", "tz", "tm", "tr", "tf", "tj", "et", "bmc", "emc",
-        // ];
-
-        // // Remove these ignored operators as we have to generate the text and fonts again
-        // content.operations.retain(|operation| {
-        //     !ignored_operators.contains(&operation.operator.to_lowercase().as_str())
-        // });
-
-        content.operations.clear();
-
-        // Let's construct the text widget
-        content.operations.append(&mut vec![
-            Operation::new("BMC", vec!["Tx".into()]),
-            Operation::new("q", vec![]),
-            Operation::new("BT", vec![]),
-        ]);
-
-        let font = parse_font(match da {
-            Object::String(ref bytes, _) => Some(from_utf8(bytes)?),
-            _ => None,
-        });
-
-        // Define some helping font variables
-        let font_name = (font.0).0;
-        let font_size = (font.0).1;
-        let font_color = font.1;
-
-        // Set the font type and size and color
-        content.operations.append(&mut vec![
-            Operation::new("Tf", vec![font_name.into(), font_size.into()]),
-            Operation::new(
-                font_color.0,
-                match font_color.0 {
-                    "k" => vec![
-                        font_color.1.into(),
-                        font_color.2.into(),
-                        font_color.3.into(),
-                        font_color.4.into(),
-                    ],
-                    "rg" => vec![
-                        font_color.1.into(),
-                        font_color.2.into(),
-                        font_color.3.into(),
-                    ],
-                    _ => vec![font_color.1.into()],
-                },
-            ),
-        ]);
-
-        let lines = if dbg!(is_multiline) {
-            dbg!(&value);
-            value
-                .split(|&c| c == 0xa)
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
-        } else {
-            vec![value]
-        };
-
-        // Calculate the text offset
-        let x = 2.0; // Suppose this fixed offset as we should have known the border here
-
-        // Formula picked up from Poppler
-        let dy = rect[1] - rect[3];
-        let y = if dy > 0.0 {
-            0.5 * dy - 0.4 * font_size as f32
-        } else {
-            -dy - 1.1 * font_size as f32
-        };
-
-        let line_height = 1.5 * font_size as f32;
-
-        dbg!(x, y, rect, dy, font_size);
-        dbg!(&lines);
-
-        content.operations.append(&mut vec![
-            Operation::new("Tr", vec![Object::from(0u32)]),
-            Operation::new("Td", vec![Object::from(1u32), Object::from(y)]),
-        ]);
-
-        for line in lines {
-            content.operations.append(&mut vec![
-                Operation::new("Tj", vec![Object::string_literal(line)]),
-                Operation::new("Td", vec![Object::from(0u32), Object::from(-line_height)]),
-            ]);
-        }
-
-        // Set the text value and some finalizing operations
-        content.operations.append(&mut vec![
-            Operation::new("ET", vec![]),
-            Operation::new("Q", vec![]),
-            Operation::new("EMC", vec![]),
-        ]);
-
-        // Set the new content to the original stream and compress it
-        if let Ok(encoded_content) = content.encode() {
-            stream.set_plain_content(encoded_content);
-            // let _ = stream.compress();
-        }
-
+    /// Reset the appearance of the field.
+    fn reset_text_appearance(&mut self, n: impl Index) -> Result<(), lopdf::Error> {
+        let field = n.field_dict_mut(self)?;
+        field.remove(b"AP");
         Ok(())
     }
 
