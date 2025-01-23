@@ -12,7 +12,9 @@ use std::str;
 
 use bitflags::_core::str::from_utf8;
 
-use lopdf::{decode_text_string, Dictionary, Document, Object, ObjectId, StringFormat};
+use lopdf::{
+    decode_text_string, encode_utf16_be, Dictionary, Document, Object, ObjectId, StringFormat,
+};
 
 use crate::utils::*;
 
@@ -497,28 +499,6 @@ impl Form {
         }
     }
 
-    pub fn set_encoded_text(
-        &mut self,
-        n: impl Index,
-        s: impl Into<Vec<u8>>,
-    ) -> Result<(), ValueError> {
-        match self.get_state(n) {
-            FieldState::Text { .. } => {
-                let Ok(field) = n.field_dict_mut(self) else {
-                    return Err(ValueError::NotFound);
-                };
-
-                field.set("V", Object::string_literal(s));
-
-                // Regenerate text appearance confoming the new text but ignore the result
-                let _ = self.reset_text_appearance(n);
-
-                Ok(())
-            }
-            _ => Err(ValueError::TypeMismatch),
-        }
-    }
-
     /// If the field at index `n` is a text field, fills in that field with the text `s`.
     /// If it is not a text field, returns ValueError
     ///
@@ -531,12 +511,12 @@ impl Form {
                     return Err(ValueError::NotFound);
                 };
 
-                field.set("V", Object::string_literal(s));
-
-                self.clear_sub_widget_rendering(n)?;
+                let encoded = encode_utf16_be(&s);
+                field.set("V", Object::string_literal(encoded));
 
                 // Regenerate text appearance confoming the new text but ignore the result
-                let _ = self.reset_text_appearance(n);
+                self.reset_text_appearance(n)?;
+                self.clear_sub_widget_appearance(n)?;
 
                 Ok(())
             }
@@ -545,9 +525,8 @@ impl Form {
     }
 
     // Clear the rendering of the sub widget
-    fn clear_sub_widget_rendering(&mut self, n: impl Index) -> Result<(), ValueError> {
+    fn clear_sub_widget_appearance(&mut self, n: impl Index) -> Result<(), ValueError> {
         // Clear the rendering of the widget
-
         match self.get_state(n) {
             FieldState::Text { .. } => {
                 let Ok(field) = n.field_dict(self) else {
@@ -608,8 +587,8 @@ impl Form {
     }
 
     /// Reset the appearance of the field.
-    fn reset_text_appearance(&mut self, n: impl Index) -> Result<(), lopdf::Error> {
-        let field = n.field_dict_mut(self)?;
+    fn reset_text_appearance(&mut self, n: impl Index) -> Result<(), ValueError> {
+        let field = n.field_dict_mut(self).ok().ok_or(ValueError::NotFound)?;
         field.remove(b"AP");
         Ok(())
     }
