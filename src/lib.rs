@@ -4,7 +4,7 @@ extern crate bitflags;
 pub mod encoding;
 mod utils;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::io::Write;
 use std::path::Path;
@@ -26,6 +26,7 @@ use crate::utils::*;
 pub struct Form {
     pub document: Document,
     form_ids: Vec<ObjectId>,
+    name_index: BTreeMap<String, ObjectId>,
 }
 
 /// The possible types of fillable form fields in a PDF
@@ -76,6 +77,14 @@ impl sealed::Index for ObjectId {}
 impl Index for ObjectId {
     fn object_id(&self, _form: &Form) -> Option<ObjectId> {
         Some(*self)
+    }
+}
+
+impl sealed::Index for &str {}
+
+impl Index for &str {
+    fn object_id(&self, form: &Form) -> Option<ObjectId> {
+        form.name_index.get(*self).copied()
     }
 }
 
@@ -185,22 +194,27 @@ impl Form {
         Self::load_doc(doc)
     }
 
+    pub fn load_document(document: Document) -> Result<Self, LoadError> {
+        Self::load_doc(document)
+    }
+
     fn load_doc(mut document: Document) -> Result<Self, LoadError> {
         let mut form_ids = Vec::new();
+        let mut name_index = BTreeMap::new();
         let mut queue = VecDeque::new();
         // Block so borrow of doc ends before doc is moved into the result
         {
+            let acroform_ref = &document
+                .trailer
+                .get(b"Root")?
+                .deref(&document)?
+                .as_dict()?
+                .get(b"AcroForm")?
+                .as_reference()?;
+
             let acroform = document
                 .objects
-                .get_mut(
-                    &document
-                        .trailer
-                        .get(b"Root")?
-                        .deref(&document)?
-                        .as_dict()?
-                        .get(b"AcroForm")?
-                        .as_reference()?,
-                )
+                .get_mut(acroform_ref)
                 .ok_or(LoadError::NotAReference)?
                 .as_dict_mut()?;
 
@@ -213,7 +227,17 @@ impl Form {
                 if let Object::Dictionary(ref dict) = *obj {
                     // If the field has FT, it actually takes input.  Save this
                     if dict.get(b"FT").is_ok() {
-                        form_ids.push(objref.as_reference().unwrap());
+                        let field_ref = objref.as_reference().unwrap();
+                        form_ids.push(field_ref);
+                        let name = match dict.get(b"T") {
+                            Ok(Object::String(data, _)) => {
+                                String::from_utf8_lossy(&data).into_owned().into()
+                            }
+                            _ => None,
+                        };
+                        if let Some(name) = name {
+                            name_index.insert(name, field_ref);
+                        }
                     }
 
                     // If this field has kids, they might have FT, so add them to the queue
@@ -223,7 +247,11 @@ impl Form {
                 }
             }
         }
-        Ok(Form { document, form_ids })
+        Ok(Form {
+            document,
+            form_ids,
+            name_index,
+        })
     }
 
     /// Returns the number of fields the form has
@@ -248,7 +276,6 @@ impl Form {
     pub fn get_type(&self, n: impl Index) -> FieldType {
         // unwraps should be fine because load should have verified everything exists
         let field = n.field_dict(self).unwrap();
-
         let type_str = field.get(b"FT").unwrap().as_name_str().unwrap_or_default();
         if type_str == "Btn" {
             let flags = ButtonFlags::from_bits_truncate(get_field_flags(field));
@@ -285,7 +312,7 @@ impl Form {
 
         // The "T" key refers to the name of the field
         match field.get(b"T") {
-            Ok(Object::String(data, _)) => String::from_utf8(data.clone()).ok(),
+            Ok(Object::String(data, _)) => String::from_utf8_lossy(data).into_owned().into(),
             _ => None,
         }
     }
